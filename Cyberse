@@ -1,0 +1,1056 @@
+#!/usr/bin/env python3
+"""
+CyberSec Scanner - Outil d'Audit de Sécurité Réseau
+AVERTISSEMENT: À utiliser UNIQUEMENT sur des réseaux dont vous êtes propriétaire
+ou avec autorisation écrite explicite. Utilisation illégale = sanctions pénales.
+"""
+
+import os
+import sys
+import json
+import time
+import logging
+import argparse
+import subprocess
+from datetime import datetime
+from threading import Thread, Lock
+from collections import defaultdict
+
+try:
+    from scapy.all import *
+    from flask import Flask, render_template_string, request, jsonify, send_file
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib.parse import urljoin, urlparse
+except ImportError as e:
+    print(f"[!] Module manquant: {e}")
+    print("[!] Installation: pip install scapy flask requests --break-system-packages")
+    sys.exit(1)
+
+# Configuration
+conf.verb = 0  # Mode silencieux pour Scapy
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Variables globales
+scan_results = defaultdict(list)
+wifi_networks = []
+vulnerability_reports = []
+results_lock = Lock()
+
+# ============================================================================
+# LOGO
+# ============================================================================
+
+LOGO = """
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║   ██████╗██╗   ██╗██████╗ ███████╗██████╗ ███████╗███████╗  ║
+║  ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██╔════╝██╔════╝  ║
+║  ██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝███████╗█████╗    ║
+║  ██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗╚════██║██╔══╝    ║
+║  ╚██████╗   ██║   ██████╔╝███████╗██║  ██║███████║███████╗  ║
+║   ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝  ║
+║                                                               ║
+║           SCANNER - Outil d'Audit de Sécurité Réseau         ║
+║                  [Version 1.0 - Éthique Uniquement]          ║
+╚═══════════════════════════════════════════════════════════════╝
+"""
+
+# ============================================================================
+# FONCTIONS DE SCAN WIFI
+# ============================================================================
+
+def scan_wifi_networks(interface="wlan0"):
+    """
+    Scan des réseaux WiFi disponibles
+    Nécessite des privilèges root et une interface en mode monitor
+    """
+    logger.info(f"[*] Démarrage du scan WiFi sur {interface}")
+    global wifi_networks
+    
+    try:
+        # Vérifier si l'interface existe
+        if not os.path.exists(f"/sys/class/net/{interface}"):
+            logger.error(f"[!] Interface {interface} introuvable")
+            return []
+        
+        networks = {}
+        
+        def packet_handler(pkt):
+            if pkt.haslayer(Dot11Beacon):
+                bssid = pkt[Dot11].addr2
+                ssid = pkt[Dot11Elt].info.decode('utf-8', errors='ignore')
+                
+                try:
+                    stats = pkt[Dot11Beacon].network_stats()
+                    channel = int(ord(pkt[Dot11Elt:3].info))
+                    crypto = set()
+                    
+                    # Détection du type de chiffrement
+                    if pkt.haslayer(Dot11Elt):
+                        cap = pkt.sprintf("{Dot11Beacon:%Dot11Beacon.cap%}")
+                        if "privacy" in cap.lower():
+                            if pkt.haslayer(RSN):
+                                crypto.add("WPA2")
+                            else:
+                                crypto.add("WEP")
+                    
+                    signal = pkt.dBm_AntSignal if hasattr(pkt, 'dBm_AntSignal') else -100
+                    
+                    networks[bssid] = {
+                        'ssid': ssid if ssid else "<Hidden>",
+                        'bssid': bssid,
+                        'channel': channel,
+                        'crypto': list(crypto) if crypto else ["Open"],
+                        'signal': signal,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                except Exception as e:
+                    logger.debug(f"Erreur parsing paquet: {e}")
+        
+        logger.info("[*] Écoute des beacons pendant 10 secondes...")
+        sniff(iface=interface, prn=packet_handler, timeout=10, store=False)
+        
+        wifi_networks = list(networks.values())
+        logger.info(f"[+] {len(wifi_networks)} réseaux WiFi détectés")
+        return wifi_networks
+        
+    except PermissionError:
+        logger.error("[!] Privilèges root requis pour le scan WiFi")
+        return []
+    except Exception as e:
+        logger.error(f"[!] Erreur scan WiFi: {e}")
+        return []
+
+# ============================================================================
+# INJECTION DE PAQUETS DE DÉCONNEXION
+# ============================================================================
+
+def inject_deauth_packets(target_mac, gateway_mac, interface="wlan0", count=10):
+    """
+    Envoie des paquets de déauthentification (ATTENTION: Illégal sans autorisation)
+    """
+    logger.warning(f"[!] Injection de déauth: {target_mac} via {gateway_mac}")
+    
+    try:
+        dot11 = Dot11(addr1=target_mac, addr2=gateway_mac, addr3=gateway_mac)
+        packet = RadioTap()/dot11/Dot11Deauth(reason=7)
+        
+        logger.info(f"[*] Envoi de {count} paquets de déauth...")
+        sendp(packet, iface=interface, count=count, inter=0.1, verbose=False)
+        
+        result = {
+            'target': target_mac,
+            'gateway': gateway_mac,
+            'packets_sent': count,
+            'timestamp': datetime.now().isoformat(),
+            'status': 'completed'
+        }
+        
+        with results_lock:
+            scan_results['deauth'].append(result)
+        
+        logger.info(f"[+] Injection terminée: {count} paquets envoyés")
+        return result
+        
+    except PermissionError:
+        logger.error("[!] Privilèges root requis")
+        return {'error': 'Permission denied'}
+    except Exception as e:
+        logger.error(f"[!] Erreur injection: {e}")
+        return {'error': str(e)}
+
+# ============================================================================
+# SCAN DE VULNÉRABILITÉS WEB
+# ============================================================================
+
+class WebVulnerabilityScanner:
+    """Scanner de vulnérabilités web (XSS, SQLi, etc.)"""
+    
+    def __init__(self, base_url):
+        self.base_url = base_url
+        self.vulnerabilities = []
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'CyberSecScanner/1.0 (Security Audit Tool)'
+        })
+    
+    def scan_xss(self, params_to_test=None):
+        """Détection de vulnérabilités XSS"""
+        logger.info(f"[*] Scan XSS sur {self.base_url}")
+        
+        xss_payloads = [
+            "<script>alert('XSS')</script>",
+            "<img src=x onerror=alert('XSS')>",
+            "javascript:alert('XSS')",
+            "<svg onload=alert('XSS')>",
+            "'\"><script>alert(String.fromCharCode(88,83,83))</script>"
+        ]
+        
+        vulnerabilities_found = []
+        
+        try:
+            # Test sur les paramètres GET
+            parsed = urlparse(self.base_url)
+            
+            for payload in xss_payloads:
+                test_url = f"{self.base_url}?test={payload}"
+                
+                try:
+                    response = self.session.get(test_url, timeout=5)
+                    
+                    if payload in response.text:
+                        vuln = {
+                            'type': 'XSS (Cross-Site Scripting)',
+                            'severity': 'HIGH',
+                            'url': test_url,
+                            'payload': payload,
+                            'description': 'Injection de script détectée - le payload est reflété dans la réponse',
+                            'remediation': 'Encoder/échapper toutes les entrées utilisateur, utiliser Content Security Policy',
+                            'timestamp': datetime.now().isoformat()
+                        }
+                        vulnerabilities_found.append(vuln)
+                        logger.warning(f"[!] XSS trouvé: {test_url}")
+                        break  # Un seul exemple suffit par URL
+                        
+                except requests.exceptions.RequestException as e:
+                    logger.debug(f"Erreur requête XSS: {e}")
+                    continue
+            
+            self.vulnerabilities.extend(vulnerabilities_found)
+            return vulnerabilities_found
+            
+        except Exception as e:
+            logger.error(f"[!] Erreur scan XSS: {e}")
+            return []
+    
+    def scan_sql_injection(self):
+        """Détection de vulnérabilités SQL Injection"""
+        logger.info(f"[*] Scan SQL Injection sur {self.base_url}")
+        
+        sql_payloads = [
+            "' OR '1'='1",
+            "' OR '1'='1' --",
+            "' OR '1'='1' /*",
+            "admin' --",
+            "' UNION SELECT NULL--",
+            "1' AND '1'='1",
+            "1' AND '1'='2"
+        ]
+        
+        sql_errors = [
+            "sql syntax",
+            "mysql_fetch",
+            "warning: mysql",
+            "unclosed quotation mark",
+            "quoted string not properly terminated",
+            "ora-01756",
+            "sqlite3.operationalerror",
+            "postgresql"
+        ]
+        
+        vulnerabilities_found = []
+        
+        try:
+            for payload in sql_payloads:
+                test_url = f"{self.base_url}?id={payload}"
+                
+                try:
+                    response = self.session.get(test_url, timeout=5)
+                    response_lower = response.text.lower()
+                    
+                    # Détection d'erreurs SQL
+                    for error in sql_errors:
+                        if error in response_lower:
+                            vuln = {
+                                'type': 'SQL Injection',
+                                'severity': 'CRITICAL',
+                                'url': test_url,
+                                'payload': payload,
+                                'description': f'Erreur SQL détectée: {error}',
+                                'remediation': 'Utiliser des requêtes préparées (prepared statements), valider et échapper les entrées',
+                                'timestamp': datetime.now().isoformat()
+                            }
+                            vulnerabilities_found.append(vuln)
+                            logger.warning(f"[!] SQLi trouvé: {test_url}")
+                            break
+                    
+                    if vulnerabilities_found:
+                        break  # Un exemple suffit
+                        
+                except requests.exceptions.RequestException as e:
+                    logger.debug(f"Erreur requête SQLi: {e}")
+                    continue
+            
+            self.vulnerabilities.extend(vulnerabilities_found)
+            return vulnerabilities_found
+            
+        except Exception as e:
+            logger.error(f"[!] Erreur scan SQLi: {e}")
+            return []
+    
+    def scan_full_website(self):
+        """Scan complet du site web"""
+        logger.info(f"[*] Scan complet de {self.base_url}")
+        
+        results = {
+            'url': self.base_url,
+            'timestamp': datetime.now().isoformat(),
+            'vulnerabilities': []
+        }
+        
+        # Headers de sécurité
+        try:
+            response = self.session.get(self.base_url, timeout=5)
+            security_headers = {
+                'X-Frame-Options': 'Clickjacking protection',
+                'X-Content-Type-Options': 'MIME type sniffing protection',
+                'Strict-Transport-Security': 'HTTPS enforcement',
+                'Content-Security-Policy': 'XSS protection',
+                'X-XSS-Protection': 'XSS filter'
+            }
+            
+            for header, description in security_headers.items():
+                if header not in response.headers:
+                    results['vulnerabilities'].append({
+                        'type': 'Missing Security Header',
+                        'severity': 'MEDIUM',
+                        'header': header,
+                        'description': f'En-tête {header} manquant ({description})',
+                        'remediation': f'Ajouter l\'en-tête {header} dans la configuration du serveur'
+                    })
+        
+        except Exception as e:
+            logger.error(f"[!] Erreur analyse headers: {e}")
+        
+        # Scan XSS
+        xss_vulns = self.scan_xss()
+        results['vulnerabilities'].extend(xss_vulns)
+        
+        # Scan SQLi
+        sqli_vulns = self.scan_sql_injection()
+        results['vulnerabilities'].extend(sqli_vulns)
+        
+        with results_lock:
+            scan_results['web'].append(results)
+        
+        logger.info(f"[+] Scan terminé: {len(results['vulnerabilities'])} vulnérabilités trouvées")
+        return results
+
+# ============================================================================
+# ENVOI DE PAQUETS PERSONNALISÉS
+# ============================================================================
+
+def send_custom_packets(target_ip, packet_type="icmp", count=10, port=80):
+    """Envoie des paquets personnalisés vers une IP"""
+    logger.info(f"[*] Envoi de {count} paquets {packet_type} vers {target_ip}")
+    
+    results = {
+        'target': target_ip,
+        'type': packet_type,
+        'count': count,
+        'responses': 0,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    try:
+        if packet_type.lower() == "icmp":
+            # Ping ICMP
+            ans, unans = sr(IP(dst=target_ip)/ICMP(), timeout=2, verbose=False, retry=0)
+            results['responses'] = len(ans)
+            results['status'] = 'Host is up' if ans else 'Host is down'
+            
+        elif packet_type.lower() == "tcp":
+            # TCP SYN scan
+            ans, unans = sr(IP(dst=target_ip)/TCP(dport=port, flags="S"), 
+                          timeout=2, verbose=False, retry=0)
+            results['responses'] = len(ans)
+            results['port'] = port
+            
+            if ans:
+                for sent, received in ans:
+                    if received.haslayer(TCP):
+                        if received[TCP].flags == 0x12:  # SYN-ACK
+                            results['status'] = f'Port {port} is open'
+                        elif received[TCP].flags == 0x14:  # RST-ACK
+                            results['status'] = f'Port {port} is closed'
+        
+        elif packet_type.lower() == "udp":
+            # UDP probe
+            ans, unans = sr(IP(dst=target_ip)/UDP(dport=port), 
+                          timeout=2, verbose=False, retry=0)
+            results['responses'] = len(ans)
+            results['port'] = port
+        
+        with results_lock:
+            scan_results['packets'].append(results)
+        
+        logger.info(f"[+] Paquets envoyés: {results['responses']}/{count} réponses")
+        return results
+        
+    except Exception as e:
+        logger.error(f"[!] Erreur envoi paquets: {e}")
+        return {'error': str(e)}
+
+# ============================================================================
+# GÉNÉRATION DE RAPPORTS
+# ============================================================================
+
+def generate_report(output_file="rapport_securite.json"):
+    """Génère un rapport complet au format JSON"""
+    logger.info(f"[*] Génération du rapport: {output_file}")
+    
+    report = {
+        'metadata': {
+            'tool': 'CyberSec Scanner',
+            'version': '1.0',
+            'generated_at': datetime.now().isoformat(),
+            'scan_duration': 'N/A'
+        },
+        'wifi_networks': wifi_networks,
+        'web_vulnerabilities': scan_results['web'],
+        'packet_injection': scan_results['deauth'],
+        'custom_packets': scan_results['packets'],
+        'summary': {
+            'total_wifi_networks': len(wifi_networks),
+            'total_vulnerabilities': sum(len(r.get('vulnerabilities', [])) for r in scan_results['web']),
+            'critical_vulnerabilities': sum(
+                1 for r in scan_results['web'] 
+                for v in r.get('vulnerabilities', []) 
+                if v.get('severity') == 'CRITICAL'
+            )
+        }
+    }
+    
+    # Sauvegarder le rapport
+    output_path = f"/home/claude/{output_file}"
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"[+] Rapport généré: {output_path}")
+        vulnerability_reports.append(output_path)
+        return output_path
+        
+    except Exception as e:
+        logger.error(f"[!] Erreur génération rapport: {e}")
+        return None
+
+# ============================================================================
+# INTERFACE WEB FLASK
+# ============================================================================
+
+app = Flask(__name__)
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CyberSec Scanner - Interface Web</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            color: #00ff00;
+            min-height: 100vh;
+        }
+        
+        .header {
+            background: rgba(0,0,0,0.8);
+            padding: 20px;
+            text-align: center;
+            border-bottom: 2px solid #00ff00;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            text-shadow: 0 0 10px #00ff00;
+        }
+        
+        .container {
+            display: flex;
+            height: calc(100vh - 100px);
+        }
+        
+        .sidebar {
+            width: 250px;
+            background: rgba(0,0,0,0.7);
+            border-right: 2px solid #00ff00;
+            padding: 20px;
+            transition: transform 0.3s;
+            overflow-y: auto;
+        }
+        
+        .sidebar.hidden {
+            transform: translateX(-100%);
+        }
+        
+        .toggle-btn {
+            position: fixed;
+            top: 100px;
+            left: 10px;
+            background: #00ff00;
+            color: #000;
+            border: none;
+            padding: 10px 15px;
+            cursor: pointer;
+            border-radius: 5px;
+            font-weight: bold;
+            z-index: 1000;
+        }
+        
+        .menu-item {
+            padding: 15px;
+            margin: 10px 0;
+            background: rgba(0,255,0,0.1);
+            border: 1px solid #00ff00;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .menu-item:hover {
+            background: rgba(0,255,0,0.3);
+            transform: translateX(5px);
+        }
+        
+        .menu-item.active {
+            background: rgba(0,255,0,0.4);
+            border-width: 2px;
+        }
+        
+        .content {
+            flex: 1;
+            padding: 30px;
+            overflow-y: auto;
+        }
+        
+        .panel {
+            display: none;
+            background: rgba(0,0,0,0.6);
+            padding: 30px;
+            border-radius: 10px;
+            border: 1px solid #00ff00;
+        }
+        
+        .panel.active {
+            display: block;
+            animation: fadeIn 0.3s;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .form-group {
+            margin: 20px 0;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+        }
+        
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 10px;
+            background: rgba(0,0,0,0.5);
+            border: 1px solid #00ff00;
+            color: #00ff00;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        
+        button {
+            background: #00ff00;
+            color: #000;
+            border: none;
+            padding: 12px 30px;
+            margin: 10px 5px;
+            cursor: pointer;
+            border-radius: 5px;
+            font-weight: bold;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+        
+        button:hover {
+            background: #00cc00;
+            transform: scale(1.05);
+            box-shadow: 0 0 20px rgba(0,255,0,0.5);
+        }
+        
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .results {
+            margin-top: 20px;
+            padding: 20px;
+            background: rgba(0,0,0,0.5);
+            border: 1px solid #00ff00;
+            border-radius: 5px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .vulnerability {
+            padding: 15px;
+            margin: 10px 0;
+            border-left: 4px solid #ff0000;
+            background: rgba(255,0,0,0.1);
+        }
+        
+        .vulnerability.high {
+            border-left-color: #ff0000;
+        }
+        
+        .vulnerability.medium {
+            border-left-color: #ff9900;
+        }
+        
+        .vulnerability.low {
+            border-left-color: #ffff00;
+        }
+        
+        .wifi-network {
+            padding: 15px;
+            margin: 10px 0;
+            background: rgba(0,255,0,0.1);
+            border-left: 4px solid #00ff00;
+            border-radius: 5px;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .loading.active {
+            display: block;
+        }
+        
+        .spinner {
+            border: 4px solid rgba(0,255,0,0.3);
+            border-top: 4px solid #00ff00;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .warning {
+            background: rgba(255,0,0,0.2);
+            border: 2px solid #ff0000;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 10px;
+        }
+        
+        .warning h3 {
+            color: #ff0000;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔒 CYBERSEC SCANNER</h1>
+        <p>Outil d'Audit de Sécurité Réseau - Version 1.0</p>
+    </div>
+    
+    <div class="warning">
+        <h3>⚠️ AVERTISSEMENT LÉGAL</h3>
+        <p>Cet outil doit être utilisé UNIQUEMENT sur des réseaux et systèmes dont vous êtes propriétaire ou pour lesquels vous avez une autorisation écrite explicite. Toute utilisation non autorisée est illégale et peut entraîner des poursuites pénales.</p>
+    </div>
+    
+    <button class="toggle-btn" onclick="toggleSidebar()">☰ Menu</button>
+    
+    <div class="container">
+        <div class="sidebar" id="sidebar">
+            <div class="menu-item active" onclick="showPanel('scan')">
+                🔍 Scan Réseau
+            </div>
+            <div class="menu-item" onclick="showPanel('reports')">
+                📊 Rapports
+            </div>
+            <div class="menu-item" onclick="showPanel('wifi')">
+                📡 Réseaux WiFi
+            </div>
+        </div>
+        
+        <div class="content">
+            <!-- Panel Scan -->
+            <div id="scan-panel" class="panel active">
+                <h2>🔍 Scan de Sécurité</h2>
+                
+                <div class="form-group">
+                    <label>Type de Scan:</label>
+                    <select id="scan-type">
+                        <option value="web">Scan Web (XSS, SQLi)</option>
+                        <option value="packets">Envoi de Paquets</option>
+                        <option value="wifi">Scan WiFi</option>
+                    </select>
+                </div>
+                
+                <div class="form-group" id="url-group">
+                    <label>URL du Site:</label>
+                    <input type="text" id="target-url" placeholder="https://example.com">
+                </div>
+                
+                <div class="form-group" id="ip-group" style="display:none;">
+                    <label>Adresse IP Cible:</label>
+                    <input type="text" id="target-ip" placeholder="192.168.1.1">
+                </div>
+                
+                <div class="form-group" id="packet-type-group" style="display:none;">
+                    <label>Type de Paquet:</label>
+                    <select id="packet-type">
+                        <option value="icmp">ICMP (Ping)</option>
+                        <option value="tcp">TCP SYN</option>
+                        <option value="udp">UDP</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="scan-xss"> Rechercher XSS
+                    </label>
+                    <label>
+                        <input type="checkbox" id="scan-sql"> Rechercher SQL Injection
+                    </label>
+                </div>
+                
+                <button onclick="startScan()">🚀 Lancer le Scan</button>
+                <button onclick="generateReport()">📄 Créer un Rapport</button>
+                
+                <div class="loading" id="loading">
+                    <div class="spinner"></div>
+                    <p>Scan en cours...</p>
+                </div>
+                
+                <div class="results" id="scan-results"></div>
+            </div>
+            
+            <!-- Panel Rapports -->
+            <div id="reports-panel" class="panel">
+                <h2>📊 Rapports de Sécurité</h2>
+                <button onclick="loadReports()">🔄 Actualiser</button>
+                <div class="results" id="reports-list"></div>
+            </div>
+            
+            <!-- Panel WiFi -->
+            <div id="wifi-panel" class="panel">
+                <h2>📡 Réseaux WiFi Détectés</h2>
+                <button onclick="scanWifi()">🔍 Scanner WiFi</button>
+                <div class="results" id="wifi-results"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('hidden');
+        }
+        
+        function showPanel(panelName) {
+            document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.menu-item').forEach(m => m.classList.remove('active'));
+            
+            document.getElementById(panelName + '-panel').classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        document.getElementById('scan-type').addEventListener('change', function() {
+            const type = this.value;
+            document.getElementById('url-group').style.display = type === 'web' ? 'block' : 'none';
+            document.getElementById('ip-group').style.display = type === 'packets' ? 'block' : 'none';
+            document.getElementById('packet-type-group').style.display = type === 'packets' ? 'block' : 'none';
+        });
+        
+        async function startScan() {
+            const scanType = document.getElementById('scan-type').value;
+            const resultsDiv = document.getElementById('scan-results');
+            const loadingDiv = document.getElementById('loading');
+            
+            loadingDiv.classList.add('active');
+            resultsDiv.innerHTML = '';
+            
+            try {
+                let response;
+                
+                if (scanType === 'web') {
+                    const url = document.getElementById('target-url').value;
+                    const xss = document.getElementById('scan-xss').checked;
+                    const sql = document.getElementById('scan-sql').checked;
+                    
+                    response = await fetch('/api/scan/web', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({url, xss, sql})
+                    });
+                } else if (scanType === 'packets') {
+                    const ip = document.getElementById('target-ip').value;
+                    const pType = document.getElementById('packet-type').value;
+                    
+                    response = await fetch('/api/scan/packets', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ip, type: pType})
+                    });
+                }
+                
+                const data = await response.json();
+                displayResults(data, scanType);
+                
+            } catch (error) {
+                resultsDiv.innerHTML = `<p style="color: red;">Erreur: ${error.message}</p>`;
+            } finally {
+                loadingDiv.classList.remove('active');
+            }
+        }
+        
+        function displayResults(data, type) {
+            const resultsDiv = document.getElementById('scan-results');
+            
+            if (type === 'web' && data.vulnerabilities) {
+                let html = `<h3>Vulnérabilités Trouvées: ${data.vulnerabilities.length}</h3>`;
+                
+                data.vulnerabilities.forEach(vuln => {
+                    html += `
+                        <div class="vulnerability ${vuln.severity.toLowerCase()}">
+                            <strong>${vuln.type}</strong> [${vuln.severity}]<br>
+                            <em>${vuln.description}</em><br>
+                            <small>Remédiation: ${vuln.remediation}</small>
+                        </div>
+                    `;
+                });
+                
+                resultsDiv.innerHTML = html;
+            } else {
+                resultsDiv.innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+            }
+        }
+        
+        async function scanWifi() {
+            const resultsDiv = document.getElementById('wifi-results');
+            resultsDiv.innerHTML = '<p>Scan en cours (nécessite des privilèges root)...</p>';
+            
+            try {
+                const response = await fetch('/api/scan/wifi');
+                const networks = await response.json();
+                
+                let html = `<h3>${networks.length} Réseaux Détectés</h3>`;
+                
+                networks.forEach(net => {
+                    html += `
+                        <div class="wifi-network">
+                            <strong>SSID:</strong> ${net.ssid}<br>
+                            <strong>BSSID:</strong> ${net.bssid}<br>
+                            <strong>Canal:</strong> ${net.channel}<br>
+                            <strong>Sécurité:</strong> ${net.crypto.join(', ')}<br>
+                            <strong>Signal:</strong> ${net.signal} dBm
+                        </div>
+                    `;
+                });
+                
+                resultsDiv.innerHTML = html;
+            } catch (error) {
+                resultsDiv.innerHTML = `<p style="color: red;">Erreur: ${error.message}</p>`;
+            }
+        }
+        
+        async function generateReport() {
+            try {
+                const response = await fetch('/api/report/generate', {method: 'POST'});
+                const data = await response.json();
+                alert('Rapport généré: ' + data.file);
+                loadReports();
+            } catch (error) {
+                alert('Erreur: ' + error.message);
+            }
+        }
+        
+        async function loadReports() {
+            const reportsDiv = document.getElementById('reports-list');
+            reportsDiv.innerHTML = '<p>Chargement des rapports...</p>';
+            
+            try {
+                const response = await fetch('/api/reports');
+                const reports = await response.json();
+                
+                let html = '<h3>Rapports Disponibles</h3>';
+                reports.forEach(report => {
+                    html += `
+                        <div class="wifi-network">
+                            <strong>${report}</strong><br>
+                            <button onclick="downloadReport('${report}')">📥 Télécharger</button>
+                        </div>
+                    `;
+                });
+                
+                reportsDiv.innerHTML = html;
+            } catch (error) {
+                reportsDiv.innerHTML = `<p style="color: red;">Erreur: ${error.message}</p>`;
+            }
+        }
+        
+        function downloadReport(filename) {
+            window.location.href = '/api/report/download?file=' + filename;
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/scan/web', methods=['POST'])
+def api_scan_web():
+    data = request.json
+    url = data.get('url')
+    scan_xss = data.get('xss', True)
+    scan_sql = data.get('sql', True)
+    
+    scanner = WebVulnerabilityScanner(url)
+    result = scanner.scan_full_website()
+    
+    return jsonify(result)
+
+@app.route('/api/scan/packets', methods=['POST'])
+def api_scan_packets():
+    data = request.json
+    ip = data.get('ip')
+    ptype = data.get('type', 'icmp')
+    
+    result = send_custom_packets(ip, packet_type=ptype)
+    return jsonify(result)
+
+@app.route('/api/scan/wifi', methods=['GET'])
+def api_scan_wifi():
+    networks = scan_wifi_networks()
+    return jsonify(networks)
+
+@app.route('/api/report/generate', methods=['POST'])
+def api_generate_report():
+    filename = f"rapport_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    filepath = generate_report(filename)
+    return jsonify({'file': filename, 'path': filepath})
+
+@app.route('/api/reports', methods=['GET'])
+def api_list_reports():
+    return jsonify(vulnerability_reports)
+
+@app.route('/api/report/download')
+def api_download_report():
+    filename = request.args.get('file')
+    return send_file(f"/home/claude/{filename}", as_attachment=True)
+
+# ============================================================================
+# MAIN - CLI
+# ============================================================================
+
+def main():
+    print(LOGO)
+    
+    parser = argparse.ArgumentParser(
+        description="CyberSec Scanner - Outil d'Audit de Sécurité Réseau",
+        epilog="AVERTISSEMENT: Usage éthique et légal uniquement!"
+    )
+    
+    parser.add_argument('--scan', action='store_true', 
+                       help='Scanner les réseaux WiFi')
+    parser.add_argument('--inject', action='store_true',
+                       help='Injection de paquets de déauth (root requis)')
+    parser.add_argument('--url', type=str,
+                       help='URL du site web à scanner')
+    parser.add_argument('--sweb', action='store_true',
+                       help='Scanner un site web complet')
+    parser.add_argument('--xss', action='store_true',
+                       help='Chercher des failles XSS')
+    parser.add_argument('--sql', action='store_true',
+                       help='Chercher des failles SQL Injection')
+    parser.add_argument('--cp', action='store_true',
+                       help='Envoyer des paquets personnalisés')
+    parser.add_argument('--ip', type=str,
+                       help='Adresse IP cible')
+    parser.add_argument('-o', '--output', type=str, default='rapport.json',
+                       help='Fichier de sortie pour le rapport')
+    parser.add_argument('--siteweb', action='store_true',
+                       help='Lancer l\'interface web Flask')
+    parser.add_argument('--interface', type=str, default='wlan0',
+                       help='Interface réseau (défaut: wlan0)')
+    
+    args = parser.parse_args()
+    
+    # Mode interface web
+    if args.siteweb:
+        logger.info("[*] Lancement de l'interface web sur http://127.0.0.1:5000")
+        app.run(host='127.0.0.1', port=5000, debug=False)
+        return
+    
+    # Scan WiFi
+    if args.scan:
+        networks = scan_wifi_networks(args.interface)
+        print(f"\n[+] {len(networks)} réseaux détectés")
+        for net in networks:
+            print(f"  • {net['ssid']:20} | {net['bssid']} | Canal {net['channel']} | {net['crypto']}")
+    
+    # Injection de paquets
+    if args.inject:
+        if not args.ip:
+            logger.error("[!] --ip requis pour l'injection")
+        else:
+            # Exemple: inject vers gateway (nécessite adaptation)
+            inject_deauth_packets(args.ip, "FF:FF:FF:FF:FF:FF", args.interface)
+    
+    # Scan web
+    if args.url:
+        scanner = WebVulnerabilityScanner(args.url)
+        
+        if args.xss:
+            vulns = scanner.scan_xss()
+            print(f"\n[+] XSS: {len(vulns)} vulnérabilités trouvées")
+        
+        if args.sql:
+            vulns = scanner.scan_sql_injection()
+            print(f"\n[+] SQLi: {len(vulns)} vulnérabilités trouvées")
+        
+        if args.sweb:
+            result = scanner.scan_full_website()
+            print(f"\n[+] Scan complet: {len(result['vulnerabilities'])} vulnérabilités")
+    
+    # Envoi de paquets
+    if args.cp and args.ip:
+        send_custom_packets(args.ip, packet_type="icmp")
+    
+    # Génération du rapport
+    if args.output:
+        report_path = generate_report(args.output)
+        print(f"\n[+] Rapport généré: {report_path}")
+
+if __name__ == "__main__":
+    main()
+
